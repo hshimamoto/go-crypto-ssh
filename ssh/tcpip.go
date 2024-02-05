@@ -17,6 +17,68 @@ import (
 	"time"
 )
 
+// hshimamoto
+type nameAddr struct {
+	name string
+	port int
+}
+
+func (na *nameAddr) Network() string {
+	return "tcp"
+}
+
+func (na *nameAddr) String() string {
+	return fmt.Sprintf("%s:%d", na.name, na.port)
+}
+
+type naListener struct {
+	na *nameAddr
+
+	conn *Client
+	in   <-chan forward
+}
+
+// Accept waits for and returns the next connection to the listener.
+func (l *naListener) Accept() (net.Conn, error) {
+	s, ok := <-l.in
+	if !ok {
+		return nil, io.EOF
+	}
+	ch, incoming, err := s.newCh.Accept()
+	if err != nil {
+		return nil, err
+	}
+	go DiscardRequests(incoming)
+
+	return &chanConn{
+		Channel: ch,
+		laddr:   l.na,
+		raddr:   s.raddr,
+	}, nil
+}
+
+// Close closes the listener.
+func (l *naListener) Close() error {
+	m := channelForwardMsg{
+		l.na.name,
+		uint32(l.na.port),
+	}
+
+	// this also closes the listener.
+	l.conn.forwards.remove(l.na)
+	ok, _, err := l.conn.SendRequest("cancel-tcpip-forward", true, Marshal(&m))
+	if err == nil && !ok {
+		err = errors.New("ssh: cancel-tcpip-forward failed")
+	}
+	return err
+}
+
+// Addr returns the listener's network address.
+func (l *naListener) Addr() net.Addr {
+	return l.na
+}
+
+
 // Listen requests the remote peer open a listening socket on
 // addr. Incoming connections will be available by calling Accept on
 // the returned net.Listener. The listener must be serviced, or the
@@ -139,6 +201,31 @@ func (c *Client) ListenTCP(laddr *net.TCPAddr) (net.Listener, error) {
 	return &tcpListener{laddr, c, ch}, nil
 }
 
+// hshimamoto
+func (c *Client) ListenName(name string, port int) (net.Listener, error) {
+	na := &nameAddr{name, port}
+
+	c.handleForwardsOnce.Do(c.handleForwards)
+
+	m := channelForwardMsg{
+		na.name,
+		uint32(na.port),
+	}
+	// send message
+	ok, _, err := c.SendRequest("tcpip-forward", true, Marshal(&m))
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, errors.New("ssh: tcpip-forward request denied by peer")
+	}
+
+	// Register this forward, using the port number we obtained.
+	ch := c.forwards.add(na)
+
+	return &naListener{na, c, ch}, nil
+}
+
 // forwardList stores a mapping between remote
 // forward requests and the tcpListeners.
 type forwardList struct {
@@ -192,6 +279,13 @@ func parseTCPAddr(addr string, port uint32) (*net.TCPAddr, error) {
 	return &net.TCPAddr{IP: ip, Port: int(port)}, nil
 }
 
+func parseNameAddr(name string, port uint32) (*nameAddr, error) {
+	if port == 0 || port > 65535 {
+		return nil, fmt.Errorf("ssh: port number out of range: %d", port)
+	}
+	return &nameAddr{name, int(port)}, nil
+}
+
 func (l *forwardList) handleChannels(in <-chan NewChannel) {
 	for ch := range in {
 		var (
@@ -214,8 +308,11 @@ func (l *forwardList) handleChannels(in <-chan NewChannel) {
 			// otherwise.
 			laddr, err = parseTCPAddr(payload.Addr, payload.Port)
 			if err != nil {
-				ch.Reject(ConnectionFailed, err.Error())
-				continue
+				laddr, err = parseNameAddr(payload.Addr, payload.Port)
+				if err != nil {
+					ch.Reject(ConnectionFailed, err.Error())
+					continue
+				}
 			}
 			raddr, err = parseTCPAddr(payload.OriginAddr, payload.OriginPort)
 			if err != nil {
